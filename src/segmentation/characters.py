@@ -4,7 +4,8 @@ Implements the three-phase algorithm:
   Phase 1 – Separation of region above the headline (skeleton-based)
   Phase 2 – Fuzzy column-score computation (four features per column)
   Phase 3 – Savitzky-Golay smoothing, peak detection, false-peak removal
-  Final assembly – cut word image and reattach separated top components
+  Phase 3b – CC-aware cut filtering + shirorekha-gap check
+  Final assembly – cut word image, reattach top components, merge tiny segments
 """
 
 from __future__ import annotations
@@ -163,14 +164,64 @@ def separate_above_headline(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Adaptive stroke-width estimation
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _estimate_stroke_width(binary: np.ndarray) -> float:
+    """Estimate median stroke width via distance transform."""
+    img = (binary > 0).astype(np.uint8)
+    if not np.any(img):
+        return 3.0
+    dt = cv2.distanceTransform(img, cv2.DIST_L2, 3)
+    skel = skeletonize(img.astype(bool))
+    vals = dt[skel]
+    if len(vals) == 0:
+        return 3.0
+    return float(np.median(vals)) * 2.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Shirorekha (headline) detection
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _find_shirorekha_band(binary: np.ndarray) -> tuple[int, int] | None:
+    """Find the row band occupied by the shirorekha.
+
+    Returns (row_start, row_end) of the densest horizontal ink band in the
+    upper half of the image, or None if no clear headline is found.
+    """
+    img = (binary > 0).astype(np.uint8)
+    H, W = img.shape
+    hp = np.sum(img, axis=1).astype(np.float64)
+    if np.max(hp) == 0:
+        return None
+
+    upper_half = hp[: max(1, H * 2 // 3)]
+    peak_row = int(np.argmax(upper_half))
+
+    threshold = hp[peak_row] * 0.5
+    r0 = peak_row
+    while r0 > 0 and hp[r0 - 1] >= threshold:
+        r0 -= 1
+    r1 = peak_row
+    while r1 < H - 1 and hp[r1 + 1] >= threshold:
+        r1 += 1
+
+    band_h = r1 - r0 + 1
+    if band_h < 1 or band_h > H // 2:
+        return None
+    return (r0, r1 + 1)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PHASE 2 – Fuzzy character-segmentation column scores
 # ═════════════════════════════════════════════════════════════════════════════
 
-_STROKE_THIN = 5
-_STROKE_THICK = 15
-
-
-def _compute_column_scores(binary: np.ndarray) -> np.ndarray:
+def _compute_column_scores(
+    binary: np.ndarray,
+    stroke_thin: float = 5.0,
+    stroke_thick: float = 15.0,
+) -> np.ndarray:
     """Compute the fuzzy possibility score S[j] for every column *j*."""
     img = (binary > 0).astype(np.uint8)
     H, W = img.shape
@@ -194,12 +245,12 @@ def _compute_column_scores(binary: np.ndarray) -> np.ndarray:
         whites_after = np.where(col[p1:] == 0)[0]
         p2 = (p1 + int(whites_after[0])) if len(whites_after) else H
         X2 = p2 - p1
-        if X2 <= _STROKE_THIN:
+        if X2 <= stroke_thin:
             mu2 = 1.0
-        elif X2 >= _STROKE_THICK:
+        elif X2 >= stroke_thick:
             mu2 = 0.0
         else:
-            mu2 = (_STROKE_THICK - X2) / (_STROKE_THICK - _STROKE_THIN)
+            mu2 = (stroke_thick - X2) / (stroke_thick - stroke_thin)
 
         # Feature X3 – white pixel count below stroke
         mu3 = (float(np.sum(col[p2:] == 0)) / H) if p2 < H else 0.0
@@ -287,6 +338,83 @@ def _verify_peaks(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PHASE 3b – CC-aware + shirorekha-gap filtering of cuts
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _filter_cuts_by_cc(
+    cuts: list[int],
+    binary: np.ndarray,
+    shiro_band: tuple[int, int] | None,
+) -> list[int]:
+    """Remove cuts that slice through large character bodies below the
+    shirorekha, or that lack a shirorekha gap.
+
+    In Devanagari the shirorekha often connects all aksharas into one
+    huge CC, so we cannot reject every cut that touches a CC.  Instead
+    we focus on the region **below** the headline:
+
+      1. If a cut column has ink from a CC whose body (below shirorekha)
+         spans across the cut on both sides, the cut is rejected -- it
+         would slice a character body.
+      2. If a shirorekha band was detected and the cut column is solid
+         ink across the entire headline band (no gap at all), the cut
+         is rejected.
+    """
+    if not cuts:
+        return cuts
+
+    img = (binary > 0).astype(np.uint8)
+    H, W = img.shape
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(img, 8)
+
+    # Determine the "body region" = rows below the shirorekha
+    body_top = shiro_band[1] if shiro_band else 0
+
+    kept: list[int] = []
+    for j in cuts:
+        col = img[:, j]
+
+        # condition 1: column has no ink at all → always keep
+        if not np.any(col):
+            kept.append(j)
+            continue
+
+        # condition 2: check the body region (below headline) for
+        # CCs that would be sliced
+        body_col = img[body_top:, j] if body_top < H else col
+        slices_body = False
+        if np.any(body_col):
+            body_labels = labels[body_top:, j] if body_top < H else labels[:, j]
+            body_lbls = set(int(l) for l in body_labels if l > 0)
+            for lbl in body_lbls:
+                x0 = stats[lbl, cv2.CC_STAT_LEFT]
+                w = stats[lbl, cv2.CC_STAT_WIDTH]
+                cc_area = stats[lbl, cv2.CC_STAT_AREA]
+                # only worry about substantial CCs (not tiny dots)
+                if cc_area < 20:
+                    continue
+                # CC body must extend on both sides of j
+                if x0 < j and x0 + w - 1 > j:
+                    slices_body = True
+                    break
+
+        if slices_body:
+            continue
+
+        # condition 3: shirorekha gap check -- at least one pixel in
+        # the headline band must be background
+        if shiro_band is not None:
+            sr0, sr1 = shiro_band
+            shiro_col = col[sr0:sr1]
+            if len(shiro_col) > 0 and np.all(shiro_col):
+                continue
+
+        kept.append(j)
+
+    return kept
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # FINAL ASSEMBLY
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -331,6 +459,76 @@ def _assemble_characters(
             chars.append(seg)
 
     return chars
+
+
+def _merge_tiny_segments(
+    chars: list[np.ndarray],
+    min_width_ratio: float = 0.15,
+    min_area: int = 30,
+) -> list[np.ndarray]:
+    """Merge character segments that are too small to be real characters.
+
+    A segment is considered "tiny" if its content width is below
+    *min_width_ratio* of the average segment width, or its ink area
+    is below *min_area* pixels.  Tiny segments are merged into their
+    nearest (left or right) neighbor.
+    """
+    if len(chars) <= 1:
+        return chars
+
+    widths = [ch.shape[1] for ch in chars]
+    avg_w = sum(widths) / len(widths) if widths else 1
+    threshold_w = max(4, avg_w * min_width_ratio)
+
+    def _ink_area(ch: np.ndarray) -> int:
+        return int(np.count_nonzero(ch))
+
+    def _content_width(ch: np.ndarray) -> int:
+        coords = cv2.findNonZero((ch > 0).astype(np.uint8))
+        if coords is None:
+            return 0
+        _, _, w, _ = cv2.boundingRect(coords)
+        return w
+
+    merged: list[np.ndarray] = list(chars)
+
+    changed = True
+    while changed and len(merged) > 1:
+        changed = False
+        i = 0
+        while i < len(merged):
+            ch = merged[i]
+            cw = _content_width(ch)
+            ca = _ink_area(ch)
+            if cw < threshold_w or ca < min_area:
+                # pick left or right neighbor (whichever exists;
+                # prefer the one with more overlap in height)
+                if i == 0:
+                    nb = 1
+                elif i == len(merged) - 1:
+                    nb = i - 1
+                else:
+                    nb = i - 1 if merged[i - 1].shape[1] >= merged[i + 1].shape[1] else i + 1
+
+                left = min(i, nb)
+                right = max(i, nb)
+                a, b = merged[left], merged[right]
+                h = max(a.shape[0], b.shape[0])
+                if a.shape[0] < h:
+                    pad_a = np.zeros((h - a.shape[0], a.shape[1]), dtype=a.dtype)
+                    a = np.vstack([a, pad_a])
+                if b.shape[0] < h:
+                    pad_b = np.zeros((h - b.shape[0], b.shape[1]), dtype=b.dtype)
+                    b = np.vstack([b, pad_b])
+                combined = np.hstack([a, b])
+
+                merged[left] = combined
+                merged.pop(right)
+                changed = True
+                break  # restart scan
+            i += 1
+
+    return merged
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -386,16 +584,31 @@ def segment_characters(
     # Phase 1
     modified, separated = separate_above_headline(word_binary, k=k)
 
-    # Phase 2
-    S = _compute_column_scores(modified)
+    # Adaptive stroke thresholds
+    sw = _estimate_stroke_width(modified)
+    stroke_thin = max(2.0, sw * 0.8)
+    stroke_thick = max(stroke_thin + 4, sw * 2.5)
 
-    # Phase 3
+    # Detect shirorekha band
+    shiro_band = _find_shirorekha_band(modified)
+
+    # Phase 2 – with adaptive thresholds
+    S = _compute_column_scores(modified, stroke_thin, stroke_thick)
+
+    # Phase 3 – smoothing, peak detection, height-based verification
     S_smooth = _smooth_scores(S, poly_order=sg_poly, window=sg_window)
     peaks = _detect_peaks(S_smooth)
     cuts = _verify_peaks(peaks, S, modified)
 
+    # Phase 3b – CC-aware + shirorekha-gap filtering
+    cuts = _filter_cuts_by_cc(cuts, modified, shiro_band)
+
     # Assembly
     chars = _assemble_characters(modified, cuts, separated)
+
+    # Merge tiny fragments into neighbors
+    chars = _merge_tiny_segments(chars)
+
     result = [
         _crop_to_content(ch)
         for ch in chars

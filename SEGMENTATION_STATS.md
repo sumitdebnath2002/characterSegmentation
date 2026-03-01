@@ -19,7 +19,15 @@
 | `handwritten_fixed2` | 9 | 43 | — | Headline attenuation added |
 | `matra_fixed` | 9 | 43 | — | Padding added to avoid clipping matras |
 | `char_test` | 9 | 43 | 187 | Character segmentation added; over-segmented chars |
-| **`cca_final`** | **9** | **40** | **128** | CCA-based lines; cleaner crops; best overall |
+| `cca_final` | 9 | 40 | 128 | CCA-based lines; cleaner crops |
+| **`image_improved`** | **9** | **40** | **73** | + Improved char seg (all 4 fixes below) |
+
+### hindi.png (printed Hindi, 5 lines)
+
+| Output Folder | Lines | Words | Characters | Notes |
+|---------------|-------|-------|------------|-------|
+| `hindi_final` | 5 | 47 | 188 | CCA lines, old char seg (heavy over-seg) |
+| **`hindi_improved2`** | **5** | **47** | **90** | + Improved char seg (all 4 fixes below) |
 
 ---
 
@@ -33,6 +41,7 @@
 | **v4 (matra fix)** | Matras clipped at line boundaries | Added `pad_y` gap-aware padding | Fewer broken glyphs at line edges |
 | **v5 (char seg)** | 187 chars (over-segmented) | Added Savitzky-Golay smoothing to fuzzy scores | Reduced to 128 chars |
 | **v6 (CCA lines)** | Padding still cut matras; border CC noise inflated bounds | CCA-based line assignment + CC masking + noise filters | Clean crops, 40 words, 128 chars |
+| **v7 (char seg v2)** | Shirorekha thin-spots → false cuts; tiny dot fragments; cuts slicing through CCs | Adaptive stroke thresholds + shirorekha gap check + CC-aware cuts + tiny-segment merge | image.png: 128→73 chars; hindi.png: 188→90 chars |
 
 ---
 
@@ -66,18 +75,51 @@
 
 ---
 
-## Final Results (`outputs/cca_final/`)
+## Final Results
+
+### image.png → `outputs/image_improved/`
 
 | Stage | Count |
 |-------|-------|
 | Lines | 9 |
 | Words | 40 |
-| Characters | 128 |
+| Characters | 73 |
+
+### hindi.png → `outputs/hindi_improved2/`
+
+| Stage | Count |
+|-------|-------|
+| Lines | 5 |
+| Words | 47 |
+| Characters | 90 |
+
+### Output Structure (same for both)
 
 | Output Path | Contents |
 |-------------|----------|
 | `annotated.png` | Full image with line (green), word (blue), character (yellow) boundaries |
-| `lines/` | 9 line crop images |
-| `words/` | 40 word crop images |
-| `characters/` | 128 character crop images |
+| `lines/` | Line crop images |
+| `words/` | Word crop images |
+| `characters/` | Character crop images |
 | `debug/` | Horizontal profile, vertical profiles, char scores, preprocessing stages |
+
+---
+
+## Character Segmentation v7: What Changed
+
+### 1. Adaptive Stroke Thresholds
+- **Old:** Fixed constants `_STROKE_THIN = 5`, `_STROKE_THICK = 15`.
+- **New:** Median stroke width estimated via distance transform on the skeleton; thresholds derived as `0.8×` and `2.5×` that width.
+- **Effect:** Adapts to both thin handwriting and thick printed text.
+
+### 2. Shirorekha Gap Check
+- **New:** Detects the headline (shirorekha) row band via horizontal projection peak. A cut is only valid if the headline has a gap (at least one background pixel) at that column.
+- **Effect:** Prevents false cuts at thin spots *within* the shirorekha where body characters are joined.
+
+### 3. CC-Aware Cut Filtering
+- **New:** After peak detection, each candidate cut is checked against the connected-component label map. If a CC body *below* the shirorekha spans both sides of the cut column, the cut is rejected.
+- **Effect:** Prevents cuts that would slice through a character body, especially for conjuncts and matras.
+
+### 4. Tiny Segment Merge
+- **New:** After assembly, any character segment narrower than 15% of the average segment width or with <30 ink pixels is merged into its nearest neighbor.
+- **Effect:** Eliminates dot/bindu fragments and shirorekha slivers that were being output as standalone "characters".
