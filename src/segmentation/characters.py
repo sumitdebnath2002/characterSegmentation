@@ -214,6 +214,87 @@ def _find_shirorekha_band(binary: np.ndarray) -> tuple[int, int] | None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Expected character width estimation
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _estimate_expected_char_width(
+    binary: np.ndarray,
+    shiro_band: tuple[int, int] | None,
+) -> float:
+    """Estimate the expected width of a single character (akshar).
+
+    Uses the median width of connected components in the body region
+    (below the shirorekha) as a proxy.  Falls back to word_width / 3
+    if no usable CCs are found.
+    """
+    img = (binary > 0).astype(np.uint8)
+    H, W = img.shape
+
+    body_top = shiro_band[1] if shiro_band else 0
+    body = img[body_top:, :] if body_top < H else img
+
+    if not np.any(body):
+        return max(W / 3.0, 10.0)
+
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(body, 8)
+    widths = []
+    for lbl in range(1, n_labels):
+        cc_w = stats[lbl, cv2.CC_STAT_WIDTH]
+        cc_h = stats[lbl, cv2.CC_STAT_HEIGHT]
+        cc_area = stats[lbl, cv2.CC_STAT_AREA]
+        if cc_area < 20 or cc_h < H * 0.15:
+            continue
+        widths.append(cc_w)
+
+    if not widths:
+        return max(W / 3.0, 10.0)
+
+    return float(np.median(widths))
+
+
+def _gate_cuts_by_width(
+    cuts: list[int],
+    S: np.ndarray,
+    word_width: int,
+    expected_char_width: float,
+    min_width_ratio: float = 0.4,
+) -> list[int]:
+    """Remove weakest cuts until all segments are at least
+    *min_width_ratio* * *expected_char_width* wide.
+    """
+    if not cuts:
+        return cuts
+
+    min_seg_width = max(5, expected_char_width * min_width_ratio)
+    result = sorted(cuts)
+
+    changed = True
+    while changed and len(result) > 0:
+        changed = False
+        bounds = [0] + result + [word_width]
+        seg_widths = [bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)]
+        narrowest_idx = int(np.argmin(seg_widths))
+
+        if seg_widths[narrowest_idx] < min_seg_width:
+            # Remove the cut adjacent to this narrow segment that has
+            # the lower S value
+            if narrowest_idx == 0:
+                result.pop(0)
+            elif narrowest_idx == len(result):
+                result.pop(-1)
+            else:
+                left_cut = result[narrowest_idx - 1]
+                right_cut = result[narrowest_idx]
+                if S[left_cut] <= S[right_cut]:
+                    result.pop(narrowest_idx - 1)
+                else:
+                    result.pop(narrowest_idx)
+            changed = True
+
+    return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PHASE 2 – Fuzzy character-segmentation column scores
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -222,7 +303,9 @@ def _compute_column_scores(
     stroke_thin: float = 5.0,
     stroke_thick: float = 15.0,
 ) -> np.ndarray:
-    """Compute the fuzzy possibility score S[j] for every column *j*."""
+    """Compute the fuzzy possibility score S[j] for every column *j*.
+
+    """
     img = (binary > 0).astype(np.uint8)
     H, W = img.shape
     S = np.zeros(W, dtype=np.float64)
@@ -284,7 +367,9 @@ def _smooth_scores(
     n = len(S)
     if n < 4:
         return S.copy()
-    w = min(window, n)
+    # Scale window with word width so wider words get more smoothing
+    adaptive_w = max(window, n // 15)
+    w = min(adaptive_w, n)
     if w % 2 == 0:
         w -= 1
     w = max(w, 3)
@@ -301,16 +386,37 @@ def _detect_peaks(S_smooth: np.ndarray) -> list[int]:
 
 
 def _verify_peaks(
-    peaks: list[int], S: np.ndarray, binary: np.ndarray,
+    peaks: list[int],
+    S: np.ndarray,
+    S_smooth: np.ndarray,
+    binary: np.ndarray,
+    expected_char_width: float = 0.0,
+    min_width_ratio: float = 0.4,
 ) -> list[int]:
-    """Remove false peaks whose inter-cut segment height < H/2."""
+    """Remove false peaks based on segment height, width, and prominence."""
     if len(peaks) < 2:
         return list(peaks)
 
-    H = binary.shape[0]
+    H, W = binary.shape
     img = (binary > 0).astype(np.uint8)
     verified = list(peaks)
 
+    min_seg_w = max(5, expected_char_width * min_width_ratio) if expected_char_width > 0 else 5
+
+    # Pass 1: prominence filter -- a peak must rise meaningfully above
+    # the average of its neighboring valleys
+    if len(S_smooth) > 2:
+        prominent: list[int] = []
+        for j in verified:
+            left_min = float(np.min(S_smooth[max(0, j - 5):j])) if j > 0 else 0.0
+            right_min = float(np.min(S_smooth[j + 1:min(len(S_smooth), j + 6)])) if j < len(S_smooth) - 1 else 0.0
+            valley_avg = (left_min + right_min) / 2.0
+            prominence = S_smooth[j] - valley_avg
+            if prominence > 0.02 or S_smooth[j] > 0.15:
+                prominent.append(j)
+        verified = prominent if prominent else verified
+
+    # Pass 2: height-based verification (original logic)
     changed = True
     while changed:
         changed = False
@@ -333,6 +439,29 @@ def _verify_peaks(
                 changed = True
             else:
                 i += 1
+
+    # Pass 3: minimum width check
+    changed = True
+    while changed and len(verified) > 0:
+        changed = False
+        bounds = [0] + verified + [W]
+        for i in range(len(bounds) - 1):
+            seg_w = bounds[i + 1] - bounds[i]
+            if seg_w < min_seg_w and len(verified) > 0:
+                # Remove the adjacent cut with lower S value
+                if i == 0 and len(verified) > 0:
+                    verified.pop(0)
+                elif i >= len(verified) and len(verified) > 0:
+                    verified.pop(-1)
+                elif i - 1 < len(verified) and i < len(verified):
+                    if S[verified[i - 1]] <= S[verified[i]]:
+                        verified.pop(i - 1)
+                    else:
+                        verified.pop(i)
+                elif i - 1 < len(verified):
+                    verified.pop(i - 1)
+                changed = True
+                break
 
     return verified
 
@@ -390,10 +519,8 @@ def _filter_cuts_by_cc(
                 x0 = stats[lbl, cv2.CC_STAT_LEFT]
                 w = stats[lbl, cv2.CC_STAT_WIDTH]
                 cc_area = stats[lbl, cv2.CC_STAT_AREA]
-                # only worry about substantial CCs (not tiny dots)
                 if cc_area < 20:
                     continue
-                # CC body must extend on both sides of j
                 if x0 < j and x0 + w - 1 > j:
                     slices_body = True
                     break
@@ -412,6 +539,196 @@ def _filter_cuts_by_cc(
         kept.append(j)
 
     return kept
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CC-based fallback for under-segmented words
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _cc_fallback_cuts(
+    binary: np.ndarray,
+    shiro_band: tuple[int, int] | None,
+    stroke_width: float,
+) -> list[int]:
+    """Find cut points using gaps between CC bounding boxes.
+
+    Used as a fallback when the fuzzy pipeline produces too few cuts
+    for a word that is clearly wider than a single character.
+    """
+    img = (binary > 0).astype(np.uint8)
+    H, W = img.shape
+
+    body_top = shiro_band[1] if shiro_band else 0
+    body = img[body_top:, :] if body_top < H else img
+
+    if not np.any(body):
+        return []
+
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(body, 8)
+
+    boxes: list[tuple[int, int]] = []
+    for lbl in range(1, n_labels):
+        cc_area = stats[lbl, cv2.CC_STAT_AREA]
+        cc_h = stats[lbl, cv2.CC_STAT_HEIGHT]
+        if cc_area < 15 or cc_h < max(3, H * 0.08):
+            continue
+        x0 = stats[lbl, cv2.CC_STAT_LEFT]
+        cc_w = stats[lbl, cv2.CC_STAT_WIDTH]
+        boxes.append((x0, x0 + cc_w))
+
+    if len(boxes) < 2:
+        return []
+
+    boxes.sort()
+
+    merged_boxes: list[tuple[int, int]] = [boxes[0]]
+    for x0, x1 in boxes[1:]:
+        prev_x0, prev_x1 = merged_boxes[-1]
+        if x0 <= prev_x1 + 1:
+            merged_boxes[-1] = (prev_x0, max(prev_x1, x1))
+        else:
+            merged_boxes.append((x0, x1))
+
+    if len(merged_boxes) < 2:
+        return []
+
+    all_gaps = []
+    for i in range(len(merged_boxes) - 1):
+        all_gaps.append(merged_boxes[i + 1][0] - merged_boxes[i][1])
+    median_gap = float(np.median(all_gaps)) if all_gaps else 0
+    gap_threshold = max(2, min(stroke_width * 1.5, median_gap * 0.5))
+
+    cuts: list[int] = []
+    for i in range(len(merged_boxes) - 1):
+        gap_start = merged_boxes[i][1]
+        gap_end = merged_boxes[i + 1][0]
+        gap = gap_end - gap_start
+        if gap >= gap_threshold:
+            cuts.append((gap_start + gap_end) // 2)
+
+    return cuts
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Skeleton-based projection profile for character segmentation
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _skeleton_projection_cuts(
+    binary: np.ndarray,
+    expected_char_width: float,
+    min_width_ratio: float = 0.4,
+) -> list[int]:
+    """Find cut points using vertical projection on the **skeletonised** image.
+
+    Sahare & Dhok (2015) showed that projection profiles on thinned images
+    produce much clearer inter-character valleys than on the original binary,
+    because thick strokes (especially the shirorekha) are reduced to 1px
+    width, revealing gaps that were hidden by stroke thickness.
+
+    The skeleton VPP is combined with the binary VPP: a candidate cut must
+    be a valley in the skeleton profile AND not pass through a high-density
+    region in the binary profile.  This prevents false cuts inside thick
+    conjuncts while still finding gaps in handwritten text.
+    """
+    img = (binary > 0).astype(np.uint8)
+    H, W = img.shape
+
+    if W < 10 or H < 5:
+        return []
+
+    skel = skeletonize(img.astype(bool)).astype(np.uint8)
+    vp_skel = np.sum(skel, axis=0).astype(np.float64)
+    vp_bin = np.sum(img, axis=0).astype(np.float64)
+
+    if np.max(vp_skel) == 0:
+        return []
+
+    # Smooth the skeleton VPP to suppress single-pixel noise
+    sw = max(3, W // 20)
+    if sw % 2 == 0:
+        sw += 1
+    sw = min(sw, W if W % 2 == 1 else W - 1)
+    if W >= 4:
+        vp_skel_s = savgol_filter(vp_skel, window_length=sw, polyorder=1)
+    else:
+        vp_skel_s = vp_skel.copy()
+
+    # Also smooth binary VPP for comparison
+    if W >= 4:
+        vp_bin_s = savgol_filter(vp_bin, window_length=sw, polyorder=1)
+    else:
+        vp_bin_s = vp_bin.copy()
+
+    # A column is a "skeleton valley" if it falls below 20% of the skeleton peak
+    skel_peak = np.max(vp_skel_s)
+    skel_thresh = skel_peak * 0.20
+    is_skel_valley = vp_skel_s < skel_thresh
+
+    # Find contiguous valley runs in the skeleton profile
+    padded = np.concatenate(([False], is_skel_valley, [False]))
+    diff = np.diff(padded.astype(np.int8))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+
+    if len(starts) == 0:
+        return []
+
+    min_seg_w = max(5, expected_char_width * min_width_ratio)
+    bin_peak = np.max(vp_bin_s) if np.max(vp_bin_s) > 0 else 1.0
+
+    candidates: list[tuple[int, float]] = []
+    for s, e in zip(starts, ends):
+        # Pick the column within the valley with the lowest skeleton density
+        valley_region = vp_skel_s[s:e]
+        best_offset = int(np.argmin(valley_region))
+        col = s + best_offset
+
+        if col < min_seg_w or col > W - min_seg_w:
+            continue
+
+        # Reject if the binary VPP at this column is still high
+        # (would mean we're cutting through a thick stroke, not a real gap)
+        bin_density = vp_bin_s[col] / bin_peak
+        if bin_density > 0.6:
+            continue
+
+        # Score: lower skeleton density + lower binary density = better cut
+        skel_density = vp_skel_s[col] / skel_peak if skel_peak > 0 else 0
+        score = skel_density + bin_density
+        candidates.append((col, score))
+
+    if not candidates:
+        return []
+
+    # Sort by column position
+    candidates.sort(key=lambda x: x[0])
+    cuts = [c for c, _ in candidates]
+
+    # Remove cuts that produce too-narrow segments, preferring cuts with
+    # lower score (= deeper valley)
+    changed = True
+    while changed and len(cuts) > 0:
+        changed = False
+        bounds = [0] + cuts + [W]
+        seg_widths = [bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)]
+        narrowest_idx = int(np.argmin(seg_widths))
+
+        if seg_widths[narrowest_idx] < min_seg_w:
+            # Find which adjacent cut to remove (the one with higher score)
+            if narrowest_idx == 0:
+                cuts.pop(0)
+            elif narrowest_idx == len(cuts):
+                cuts.pop(-1)
+            else:
+                left_score = next(sc for c, sc in candidates if c == cuts[narrowest_idx - 1])
+                right_score = next(sc for c, sc in candidates if c == cuts[narrowest_idx])
+                if left_score >= right_score:
+                    cuts.pop(narrowest_idx - 1)
+                else:
+                    cuts.pop(narrowest_idx)
+            changed = True
+
+    return cuts
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -463,72 +780,132 @@ def _assemble_characters(
 
 def _merge_tiny_segments(
     chars: list[np.ndarray],
-    min_width_ratio: float = 0.15,
-    min_area: int = 30,
+    min_width_ratio: float = 0.25,
+    min_area: int = 50,
+    min_ink_ratio: float = 0.10,
+    stroke_width: float = 3.0,
 ) -> list[np.ndarray]:
     """Merge character segments that are too small to be real characters.
 
-    A segment is considered "tiny" if its content width is below
-    *min_width_ratio* of the average segment width, or its ink area
-    is below *min_area* pixels.  Tiny segments are merged into their
-    nearest (left or right) neighbor.
+    A segment is "tiny" if:
+    - its content width is below *min_width_ratio* of the **median** width
+    - its ink area is below *min_area*
+    - its ink area is < *min_ink_ratio* of the largest segment's ink area
+    - its aspect ratio (w/h) < 0.3  (vertical sliver)
     """
     if len(chars) <= 1:
         return chars
 
-    widths = [ch.shape[1] for ch in chars]
-    avg_w = sum(widths) / len(widths) if widths else 1
-    threshold_w = max(4, avg_w * min_width_ratio)
-
     def _ink_area(ch: np.ndarray) -> int:
         return int(np.count_nonzero(ch))
 
-    def _content_width(ch: np.ndarray) -> int:
+    def _content_dims(ch: np.ndarray) -> tuple[int, int]:
         coords = cv2.findNonZero((ch > 0).astype(np.uint8))
         if coords is None:
-            return 0
-        _, _, w, _ = cv2.boundingRect(coords)
-        return w
+            return 0, 0
+        _, _, w, h = cv2.boundingRect(coords)
+        return w, h
+
+    def _merge_pair(merged: list[np.ndarray], i: int, nb: int) -> None:
+        left = min(i, nb)
+        right = max(i, nb)
+        a, b = merged[left], merged[right]
+        h = max(a.shape[0], b.shape[0])
+        if a.shape[0] < h:
+            pad_a = np.zeros((h - a.shape[0], a.shape[1]), dtype=a.dtype)
+            a = np.vstack([a, pad_a])
+        if b.shape[0] < h:
+            pad_b = np.zeros((h - b.shape[0], b.shape[1]), dtype=b.dtype)
+            b = np.vstack([b, pad_b])
+        merged[left] = np.hstack([a, b])
+        merged.pop(right)
 
     merged: list[np.ndarray] = list(chars)
+
+    # Absolute floor: a character should be at least a few pixels wide,
+    # but not wider than reasonable for the stroke thickness
+    abs_min_w = max(6, min(stroke_width * 1.5, 15))
 
     changed = True
     while changed and len(merged) > 1:
         changed = False
-        i = 0
-        while i < len(merged):
+        ink_areas = [_ink_area(ch) for ch in merged]
+        max_ink = max(ink_areas) if ink_areas else 1
+        ink_threshold = max(min_area, max_ink * min_ink_ratio)
+
+        # Use median (not mean) so slivers don't drag the reference down
+        widths = sorted(ch.shape[1] for ch in merged)
+        median_w = widths[len(widths) // 2] if widths else 1
+        threshold_w = max(abs_min_w, median_w * min_width_ratio)
+
+        for i in range(len(merged)):
             ch = merged[i]
-            cw = _content_width(ch)
-            ca = _ink_area(ch)
-            if cw < threshold_w or ca < min_area:
-                # pick left or right neighbor (whichever exists;
-                # prefer the one with more overlap in height)
+            cw, ch_h = _content_dims(ch)
+            ca = ink_areas[i]
+            ar = cw / max(ch_h, 1) if ch_h > 0 else 0
+
+            is_tiny = (
+                cw < threshold_w
+                or ca < min_area
+                or ca < ink_threshold
+                or ar < 0.35
+                or cw < 8
+            )
+            if is_tiny:
                 if i == 0:
                     nb = 1
                 elif i == len(merged) - 1:
                     nb = i - 1
                 else:
                     nb = i - 1 if merged[i - 1].shape[1] >= merged[i + 1].shape[1] else i + 1
-
-                left = min(i, nb)
-                right = max(i, nb)
-                a, b = merged[left], merged[right]
-                h = max(a.shape[0], b.shape[0])
-                if a.shape[0] < h:
-                    pad_a = np.zeros((h - a.shape[0], a.shape[1]), dtype=a.dtype)
-                    a = np.vstack([a, pad_a])
-                if b.shape[0] < h:
-                    pad_b = np.zeros((h - b.shape[0], b.shape[1]), dtype=b.dtype)
-                    b = np.vstack([b, pad_b])
-                combined = np.hstack([a, b])
-
-                merged[left] = combined
-                merged.pop(right)
+                _merge_pair(merged, i, nb)
                 changed = True
-                break  # restart scan
-            i += 1
+                break
 
     return merged
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Post-segmentation re-split of oversized segments
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _resplit_oversized(
+    chars: list[np.ndarray],
+    median_char_width: float,
+    max_ar: float = 2.0,
+    width_mult: float = 1.8,
+) -> list[np.ndarray]:
+    """Re-segment any character crop that is suspiciously wide.
+
+    A crop is considered "oversized" if its aspect ratio (w/h) exceeds
+    *max_ar* OR its width exceeds *width_mult* * *median_char_width*.
+    Such crops are re-segmented using a simplified skeleton-projection
+    approach with relaxed parameters (no CC filtering).
+    """
+    if not chars or median_char_width < 5:
+        return chars
+
+    result: list[np.ndarray] = []
+    for ch in chars:
+        h, w = ch.shape[:2]
+        ar = w / max(h, 1)
+        if (ar > max_ar or w > width_mult * median_char_width) and w > 20:
+            sub_cuts = _skeleton_projection_cuts(
+                ch, median_char_width, min_width_ratio=0.35,
+            )
+            if len(sub_cuts) > 0:
+                bounds = [0] + sorted(sub_cuts) + [w]
+                for i in range(len(bounds) - 1):
+                    x0, x1 = bounds[i], bounds[i + 1]
+                    sub = ch[:, x0:x1].copy()
+                    if np.any(sub > 0):
+                        cropped = _crop_to_content(sub)
+                        if cropped.shape[0] >= 4 and cropped.shape[1] >= 4:
+                            result.append(cropped)
+                continue
+        result.append(ch)
+
+    return result
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -541,6 +918,7 @@ def segment_characters(
     k: float = 0.6,
     sg_window: int = 7,
     sg_poly: int = 1,
+    min_char_width_ratio: float = 0.4,
     return_debug: bool = False,
 ) -> list[np.ndarray] | tuple[list[np.ndarray], dict]:
     """Segment a binary word image into individual characters.
@@ -551,6 +929,9 @@ def segment_characters(
     k : Threshold ratio for above-headline detection (Phase 1).
     sg_window : Savitzky-Golay smoothing window (Phase 3, must be odd).
     sg_poly : Savitzky-Golay polynomial order.
+    min_char_width_ratio : Minimum segment width as a fraction of the
+        estimated character width. Cuts producing narrower segments are
+        removed.
     return_debug : Also return a dict of intermediate arrays.
 
     Returns
@@ -592,28 +973,92 @@ def segment_characters(
     # Detect shirorekha band
     shiro_band = _find_shirorekha_band(modified)
 
+    # Estimate expected character width
+    expected_cw = _estimate_expected_char_width(modified, shiro_band)
+
     # Phase 2 – with adaptive thresholds
     S = _compute_column_scores(modified, stroke_thin, stroke_thick)
 
-    # Phase 3 – smoothing, peak detection, height-based verification
+    # Phase 3 – smoothing, peak detection, verification with width + prominence
     S_smooth = _smooth_scores(S, poly_order=sg_poly, window=sg_window)
     peaks = _detect_peaks(S_smooth)
-    cuts = _verify_peaks(peaks, S, modified)
+    cuts = _verify_peaks(
+        peaks, S, S_smooth, modified,
+        expected_char_width=expected_cw,
+        min_width_ratio=min_char_width_ratio,
+    )
 
     # Phase 3b – CC-aware + shirorekha-gap filtering
     cuts = _filter_cuts_by_cc(cuts, modified, shiro_band)
 
+    # Width gating: remove weakest peaks until segments are wide enough
+    cuts = _gate_cuts_by_width(
+        cuts, S, W,
+        expected_char_width=expected_cw,
+        min_width_ratio=min_char_width_ratio,
+    )
+
+    # Fallback chain for under-segmented words:
+    #   1. CC gap analysis
+    #   2. Skeleton-based projection profile (Sahare & Dhok approach)
+    n_expected_chars = max(1, round(W / expected_cw))
+    too_few_cuts = len(cuts) < max(1, n_expected_chars - 1)
+    word_clearly_multi = W > 1.5 * expected_cw
+
+    if too_few_cuts and word_clearly_multi:
+        cc_cuts = _cc_fallback_cuts(modified, shiro_band, sw)
+        if len(cc_cuts) > len(cuts):
+            cuts = cc_cuts
+
+    # If still under-segmented, try skeleton projection fallback
+    too_few_cuts = len(cuts) < max(1, n_expected_chars - 1)
+    if too_few_cuts and word_clearly_multi:
+        skel_cuts = _skeleton_projection_cuts(modified, expected_cw, min_char_width_ratio)
+        if len(skel_cuts) > len(cuts):
+            cuts = skel_cuts
+
     # Assembly
     chars = _assemble_characters(modified, cuts, separated)
 
-    # Merge tiny fragments into neighbors
-    chars = _merge_tiny_segments(chars)
+    # Merge tiny fragments (slivers, matra fragments) into neighbors
+    chars = _merge_tiny_segments(chars, stroke_width=sw)
 
     result = [
         _crop_to_content(ch)
         for ch in chars
         if ch.size > 0 and np.any(ch > 0)
     ]
+
+    # Filter degenerate crops (slivers, tiny dots)
+    result = [
+        ch for ch in result
+        if ch.shape[0] >= 4 and ch.shape[1] >= 4
+        and ch.shape[0] / max(ch.shape[1], 1) < 5
+        and ch.shape[1] / max(ch.shape[0], 1) < 5
+    ]
+
+    # Re-split oversized segments that the initial pass missed
+    if len(result) > 1:
+        seg_widths = sorted(ch.shape[1] for ch in result)
+        median_seg_w = seg_widths[len(seg_widths) // 2]
+    else:
+        median_seg_w = expected_cw
+    result = _resplit_oversized(result, median_seg_w)
+
+    # Second merge pass to clean up any new slivers from re-splitting
+    result = _merge_tiny_segments(result, stroke_width=sw)
+    result = [
+        _crop_to_content(ch)
+        for ch in result
+        if ch.size > 0 and np.any(ch > 0)
+    ]
+    result = [
+        ch for ch in result
+        if ch.shape[0] >= 4 and ch.shape[1] >= 4
+        and ch.shape[0] / max(ch.shape[1], 1) < 5
+        and ch.shape[1] / max(ch.shape[0], 1) < 5
+    ]
+
     if not result:
         result = [word_binary]
 

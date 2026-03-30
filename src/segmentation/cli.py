@@ -52,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable headline (shirorekha) attenuation before word segmentation.",
     )
     p.add_argument(
+        "--no-rule-removal", action="store_true",
+        help="Disable automatic ruled notebook line removal.",
+    )
+    p.add_argument(
         "--debug", action="store_true",
         help="Save debug visualizations (projection plots, preprocessing stages).",
     )
@@ -87,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--sg-window", type=int, default=7,
         help="Savitzky-Golay window for character score smoothing (default: 7).",
     )
+    p.add_argument(
+        "--min-char-width-ratio", type=float, default=0.4,
+        help="Minimum segment width as a fraction of estimated character width. "
+        "Cuts producing narrower segments are removed (default: 0.4).",
+    )
     return p
 
 
@@ -106,6 +115,7 @@ def main(argv: list[str] | None = None) -> None:
         binarize_method=args.binarize,
         do_deskew=not args.no_deskew,
         do_slant_correct=not args.no_slant,
+        do_remove_rules=not args.no_rule_removal,
     )
 
     if args.debug:
@@ -182,6 +192,7 @@ def main(argv: list[str] | None = None) -> None:
                 chars, dbg = segment_characters(
                     wc,
                     sg_window=args.sg_window,
+                    min_char_width_ratio=args.min_char_width_ratio,
                     return_debug=True,
                 )
                 line_cuts.append(dbg["cuts"])

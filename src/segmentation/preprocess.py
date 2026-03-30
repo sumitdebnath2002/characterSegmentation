@@ -41,6 +41,41 @@ def remove_small_noise(binary: np.ndarray, min_area: int = 30) -> np.ndarray:
     return clean
 
 
+# ── Ruled-line suppression ────────────────────────────────────────────────────
+
+def remove_ruled_lines(
+    binary: np.ndarray,
+    min_line_fraction: float = 0.6,
+    min_rule_count: int = 3,
+) -> np.ndarray:
+    """Remove horizontal ruled notebook lines from a binary image.
+
+    Uses morphological opening with a very wide horizontal kernel to
+    isolate strokes that span a large fraction of the page width.  These
+    are much longer than any text shirorekha (which is word-length), so
+    the distinction is reliable.
+
+    The removal is only applied when at least *min_rule_count* such long
+    strokes are found, to avoid false positives on non-ruled images.
+    """
+    h, w = binary.shape
+    kw = max(int(w * min_line_fraction), 50)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+    rules = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    if not np.any(rules):
+        return binary
+
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(rules, 8)
+    long_count = sum(
+        1 for i in range(1, n_labels)
+        if stats[i, cv2.CC_STAT_WIDTH] > w * 0.4
+    )
+    if long_count >= min_rule_count:
+        return cv2.subtract(binary, rules)
+    return binary
+
+
 # ── Skew (whole-page rotation) ──────────────────────────────────────────────
 
 def estimate_skew(binary: np.ndarray, angle_range: float = 10.0, steps: int = 181) -> float:
@@ -184,6 +219,7 @@ def preprocess(
     do_deskew: bool = True,
     do_slant_correct: bool = True,
     do_crop: bool = True,
+    do_remove_rules: bool = True,
     noise_min_area: int = 30,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Full preprocessing pipeline.
@@ -194,6 +230,8 @@ def preprocess(
     gray = denoise(gray)
     binary = binarize(gray, method=binarize_method)
     binary = remove_small_noise(binary, min_area=noise_min_area)
+    if do_remove_rules:
+        binary = remove_ruled_lines(binary)
     if do_deskew:
         binary = deskew(binary)
     if do_slant_correct:
